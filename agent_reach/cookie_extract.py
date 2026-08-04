@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Least-privilege cookie extraction from local browsers.
+"""Извлечение куки из локальных браузеров с минимальными привилегиями.
 
-Supports: Chrome, Firefox, Edge, Brave, Opera
-Extracts one explicitly requested platform at a time.
+Поддерживает: Chrome, Firefox, Edge, Brave, Opera
+Извлекает куки для одной явно запрошенной платформы за раз.
 
-Usage:
+Использование:
     agent-reach configure --from-browser chrome --platform xueqiu
 """
 
@@ -39,7 +39,7 @@ PLATFORM_SPECS: Tuple[PlatformSpec, ...] = (
     {
         "name": "XiaoHongShu",
         "domains": (".xiaohongshu.com",),
-        "cookies": None,  # manual Cookie-Editor export only
+        "cookies": None,  # только ручной экспорт через Cookie-Editor
         "config_key": "xhs",
     },
     {
@@ -88,7 +88,7 @@ _CHROMIUM_USER_DATA_DIRS: Dict[str, ChromiumPaths] = {
 
 @dataclass(frozen=True)
 class BrowserConfigResult:
-    """One browser configuration outcome with non-secret write targets."""
+    """Результат настройки одного браузера с несекретными целями записи."""
 
     platform: str
     success: bool
@@ -96,14 +96,14 @@ class BrowserConfigResult:
     targets: Tuple[str, ...] = ()
 
     def __iter__(self) -> Iterator[object]:
-        """Preserve the historical three-value unpacking API."""
+        """Сохраняет исторический API распаковки из трёх значений."""
         yield self.platform
         yield self.success
         yield self.message
 
 
 def _chromium_user_data_dir(browser: str) -> Optional[Path]:
-    """Return the browser's profile root on the current operating system."""
+    """Возвращает корневой каталог профиля браузера в текущей ОС."""
     import os
     import sys
 
@@ -120,7 +120,7 @@ def _chromium_user_data_dir(browser: str) -> Optional[Path]:
 
 
 def list_browser_profiles(browser: str = "chrome") -> List[Dict[str, str]]:
-    """List named Chromium profiles that contain a cookie database."""
+    """Возвращает именованные профили Chromium, содержащие базу куки."""
     browser = browser.lower()
     root = _chromium_user_data_dir(browser)
     if root is None:
@@ -155,12 +155,12 @@ def list_browser_profiles(browser: str = "chrome") -> List[Dict[str, str]]:
 
 
 def _profile_cookie_file(browser: str, profile: str) -> str:
-    """Resolve an explicit profile or fail without falling back to Default."""
+    """Находит явно указанный профиль или выбрасывает ошибку без отката к Default."""
     if browser not in PROFILE_SELECTABLE_BROWSERS:
         raise ValueError(
-            "Profile selection is supported only for "
+            "Выбор профиля поддерживается только для "
             f"{', '.join(PROFILE_SELECTABLE_BROWSERS)}, "
-            f"not {scrub_url_credentials(browser)}."
+            f"а не для {scrub_url_credentials(browser)}."
         )
 
     profiles = list_browser_profiles(browser)
@@ -171,37 +171,37 @@ def _profile_cookie_file(browser: str, profile: str) -> str:
     available = ", ".join(
         scrub_url_credentials(item["folder"]) for item in profiles
     )
-    hint = f" Available profiles: {available}." if available else ""
+    hint = f" Доступные профили: {available}." if available else ""
     raise ValueError(
-        f"Profile '{scrub_url_credentials(profile)}' not found for "
+        f"Профиль '{scrub_url_credentials(profile)}' не найден для "
         f"{scrub_url_credentials(browser)}.{hint}"
     )
 
 
 def _platform_spec(platform: Optional[str]) -> PlatformSpec:
-    """Return the one explicitly requested platform specification."""
+    """Возвращает спецификацию одной явно запрошенной платформы."""
     if not platform:
         raise ValueError(
-            "platform is required for browser-cookie extraction; "
-            f"choose one of: {', '.join(_PLATFORM_SPECS_BY_KEY)}"
+            "Для извлечения куки из браузера необходимо указать платформу; "
+            f"выберите одну из: {', '.join(_PLATFORM_SPECS_BY_KEY)}"
         )
     key = platform.lower()
     try:
         return _PLATFORM_SPECS_BY_KEY[key]
     except KeyError as exc:
         raise ValueError(
-            f"Unsupported platform: {scrub_url_credentials(platform)}. "
-            f"Supported: {', '.join(_PLATFORM_SPECS_BY_KEY)}"
+            f"Неподдерживаемая платформа: {scrub_url_credentials(platform)}. "
+            f"Поддерживаются: {', '.join(_PLATFORM_SPECS_BY_KEY)}"
         ) from exc
 
 
 def _require_browser_extractable(spec: PlatformSpec) -> None:
-    """Reject platforms whose project policy requires a manual cookie export."""
+    """Отклоняет платформы, чья политика требует ручного экспорта куки."""
     manual_key = _COOKIE_EDITOR_ONLY.get(spec["config_key"])
     if manual_key:
         raise ValueError(
-            f"Automatic browser extraction is disabled for {spec['name']}. "
-            "Export the required cookies with Cookie-Editor, then use "
+            f"Автоматическое извлечение из браузера отключено для {spec['name']}. "
+            "Экспортируйте нужные куки через Cookie-Editor, затем используйте "
             f"`agent-reach configure {manual_key}`."
         )
 
@@ -213,12 +213,12 @@ def extract_all(
     profile: Optional[str] = None,
 ) -> Dict[str, dict]:
     """
-    Extract cookies for one explicitly requested platform.
+    Извлекает куки для одной явно запрошенной платформы.
 
-    The legacy function name is retained for API compatibility, but an
-    all-platform read is intentionally no longer supported.
+    Старое имя функции сохранено для обратной совместимости API,
+    но чтение всех платформ за один раз намеренно больше не поддерживается.
 
-    Returns:
+    Возвращает:
         {"xueqiu": {"xq_a_token": "xxx"}}
     """
     spec = _platform_spec(platform)
@@ -226,17 +226,17 @@ def extract_all(
     browser = browser.lower()
     if browser not in SUPPORTED_BROWSERS:
         raise ValueError(
-            f"Unsupported browser: {scrub_url_credentials(browser)}. "
-            f"Supported: {', '.join(SUPPORTED_BROWSERS)}"
+            f"Неподдерживаемый браузер: {scrub_url_credentials(browser)}. "
+            f"Поддерживаются: {', '.join(SUPPORTED_BROWSERS)}"
         )
     cookie_file = _profile_cookie_file(browser, profile) if profile else None
     needed_cookies = spec["cookies"]
     if needed_cookies is None:
         raise ValueError(
-            f"Automatic full-domain extraction is disabled for {spec['name']}."
+            f"Автоматическое извлечение по всему домену отключено для {spec['name']}."
         )
 
-    # Try rookiepy first (Rust-based, more stable), fallback to browser_cookie3
+    # Сначала пробуем rookiepy (на Rust, стабильнее), затем browser_cookie3
     use_rookiepy = False
     if cookie_file is None:
         try:
@@ -249,18 +249,18 @@ def extract_all(
             import browser_cookie3
         except ImportError:
             profile_hint = (
-                f" for profile '{scrub_url_credentials(profile)}'"
+                f" для профиля '{scrub_url_credentials(profile)}'"
                 if profile is not None
                 else ""
             )
             raise RuntimeError(
-                f"Cookie extraction{profile_hint} requires browser_cookie3"
-                " (or rookiepy when no profile is selected).\n"
-                "Install: pip install browser-cookie3"
+                f"Извлечение куки{profile_hint} требует browser_cookie3"
+                " (или rookiepy, если профиль не выбран).\n"
+                "Установите: pip install browser-cookie3"
             )
 
     if use_rookiepy:
-        # rookiepy returns list of dicts with name/value/domain/path keys
+        # rookiepy возвращает список словарей с ключами name/value/domain/path
         try:
             browser_funcs = {
                 "chrome": rookiepy.chrome,
@@ -270,7 +270,7 @@ def extract_all(
                 "opera": rookiepy.opera,
             }
             raw_cookies = browser_funcs[browser](list(spec["domains"]))
-            # Wrap into objects with .name, .value, .domain for compatibility
+            # Оборачиваем в объекты с .name, .value, .domain для совместимости
             class _Cookie:
                 def __init__(self, d):
                     self.name = d.get("name", "")
@@ -279,9 +279,9 @@ def extract_all(
             cookie_jar = [_Cookie(c) for c in raw_cookies]
         except Exception as e:
             raise RuntimeError(
-                f"Could not read {browser} cookies via rookiepy: "
+                f"Не удалось прочитать куки {browser} через rookiepy: "
                 f"{scrub_url_credentials(e)}\n"
-                f"Make sure {browser} is closed and you have permission."
+                f"Убедитесь, что {browser} закрыт и у вас есть права доступа."
             )
     else:
         browser_funcs = {
@@ -310,15 +310,15 @@ def extract_all(
                         cookie_jar.append(cookie)
         except Exception as e:
             raise RuntimeError(
-                f"Could not read {browser} cookies: {scrub_url_credentials(e)}\n"
-                f"Make sure {browser} is closed and you have permission."
+                f"Не удалось прочитать куки {browser}: {scrub_url_credentials(e)}\n"
+                f"Убедитесь, что {browser} закрыт и у вас есть права доступа."
             )
 
     results = {}
 
     platform_cookies = {}
     for cookie in cookie_jar:
-        # Re-check returned cookies instead of trusting the backend filter.
+        # Перепроверяем возвращённые куки вместо слепого доверия фильтру бэкенда.
         if not domain_matches(cookie.domain, *spec["domains"]):
             continue
 
@@ -332,7 +332,7 @@ def extract_all(
 
 
 def _read_xfetch_session(path: Path) -> dict:
-    """Read a small regular legacy session file without following symlinks."""
+    """Читает небольшой устаревший файл сессии без перехода по символическим ссылкам."""
     import json
 
     from agent_reach.utils.paths import read_small_text_no_follow
@@ -345,12 +345,12 @@ def _read_xfetch_session(path: Path) -> dict:
         return {}
     loaded = json.loads(payload)
     if not isinstance(loaded, dict):
-        raise ValueError("xfetch 会话文件必须是 JSON object")
+        raise ValueError("Файл сессии xfetch должен быть JSON-объектом")
     return loaded
 
 
 def _sync_xfetch_session(auth_token: str, ct0: str) -> bool:
-    """Sync Twitter credentials to ~/.config/xfetch/session.json (legacy xreach compat)."""
+    """Синхронизирует учётные данные Twitter в ~/.config/xfetch/session.json (совместимость с xreach)."""
     import json
     import os
 
@@ -372,17 +372,17 @@ def _sync_xfetch_session(auth_token: str, ct0: str) -> bool:
         )
         return True
     except Exception:
-        # Non-fatal: agent-reach config is the source of truth, xfetch sync is best-effort
+        # Некритично: конфиг agent-reach — основной источник истины, синхронизация xfetch — по возможности
         return False
 
 
 def _sync_bird_env(auth_token: str, ct0: str) -> bool:
-    """Write Twitter credentials to ~/.config/bird/credentials.env for bird CLI.
+    """Записывает учётные данные Twitter в ~/.config/bird/credentials.env для CLI bird.
 
-    bird reads AUTH_TOKEN and CT0 from environment variables. This writes a
-    shell-sourceable file so users can `source ~/.config/bird/credentials.env`.
-    Values are passed through shlex.quote so a token containing a quote, $, or
-    backtick cannot break out into shell syntax when the file is sourced.
+    bird читает AUTH_TOKEN и CT0 из переменных окружения. Эта функция создаёт
+    файл, который можно подключить через `source ~/.config/bird/credentials.env`.
+    Значения проходят через shlex.quote, чтобы токен с кавычкой, $ или обратным
+    апострофом не сломал синтаксис оболочки при подключении файла.
     """
     import os
     import shlex
@@ -403,11 +403,11 @@ def _sync_bird_env(auth_token: str, ct0: str) -> bool:
         )
         return True
     except Exception:
-        # Non-fatal: agent-reach config is the source of truth, bird env sync is best-effort
+        # Некритично: конфиг agent-reach — основной источник истины, синхронизация bird — по возможности
         return False
 
 
-# Alias for callers expecting the name _sync_bird_credentials
+# Псевдоним для вызывающего кода, ожидающего имя _sync_bird_credentials
 _sync_bird_credentials = _sync_bird_env
 
 
@@ -419,11 +419,11 @@ def configure_from_browser(
     profile: Optional[str] = None,
 ) -> List[BrowserConfigResult]:
     """
-    Extract and configure exactly one explicitly selected platform.
+    Извлекает и настраивает ровно одну явно выбранную платформу.
 
-    Result objects still unpack as ``(platform, success, message)`` and expose
-    a ``targets`` attribute so the CLI can disclose every non-secret config key
-    or legacy path written.
+    Объекты-результаты по-прежнему распаковываются как ``(platform, success, message)``
+    и предоставляют атрибут ``targets``, чтобы CLI мог показать все несекретные
+    ключи конфигурации или записанные устаревшие пути.
     """
     spec = _platform_spec(platform)
     _require_browser_extractable(spec)
@@ -440,7 +440,7 @@ def configure_from_browser(
     except Exception as e:
         return [
             BrowserConfigResult(
-                "Browser", False, scrub_url_credentials(e)
+                "Браузер", False, scrub_url_credentials(e)
             )
         ]
 
@@ -450,8 +450,8 @@ def configure_from_browser(
             BrowserConfigResult(
                 spec["name"],
                 False,
-                f"No {spec['name']} cookies found in {browser}. "
-                f"Make sure you're logged into the selected platform.",
+                f"Куки {spec['name']} не найдены в {browser}. "
+                f"Убедитесь, что вы вошли в выбранную платформу.",
             )
         ]
 
@@ -476,8 +476,8 @@ def configure_from_browser(
                 BrowserConfigResult(
                     "Bilibili",
                     False,
-                    f"No SESSDATA found. "
-                    f"Make sure you're logged into bilibili.com in {browser}.",
+                    f"SESSDATA не найден. "
+                    f"Убедитесь, что вы вошли в bilibili.com в {browser}.",
                 )
             )
 
@@ -499,7 +499,7 @@ def configure_from_browser(
                 BrowserConfigResult(
                     "Xueqiu",
                     False,
-                    f"未找到 xq_a_token，请先在 {browser} 中登录 xueqiu.com",
+                    f"xq_a_token не найден, сначала войдите в xueqiu.com через {browser}",
                 )
             )
 

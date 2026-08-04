@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Whisper audio transcription with Groq → OpenAI fallback.
+"""
+Whisper audio transcription with Groq → OpenAI fallback.
 
 Downloads audio (yt-dlp), compresses + chunks (ffmpeg), and posts to a
 Whisper-compatible API. Defaults to Groq's free `whisper-large-v3` and falls
 back to OpenAI's `whisper-1` on HTTP error.
-
-Public entry point:
-    transcribe(source, *, provider="auto", out_dir=None, config=None) -> str
-
-Designed to be importable from channels (e.g. YouTubeChannel.transcribe).
 """
 
 from __future__ import annotations
@@ -18,24 +14,28 @@ import math
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from agent_reach.config import Config
 
-# Whisper API limit is 25MB; leave headroom for multipart overhead.
-SIZE_LIMIT_BYTES = 24 * 1024 * 1024
-CHUNK_SECONDS = 600  # 10 min — small enough that boundary cuts rarely lose meaning
-MAX_SOURCE_BYTES = 512 * 1024 * 1024
-MAX_CHUNKS = 24  # 4 hours at the standard 10-minute segment size
+# --- Constants & Limits ---
+SIZE_LIMIT_BYTES = 24 * 1024 * 1024  # 24 MiB (Headroom for 25MB API limit)
+CHUNK_SECONDS = 600                  # 10 minutes
+MAX_SOURCE_BYTES = 512 * 1024 * 1024  # 512 MiB
+MAX_CHUNKS = 24                      # ~4 Hours max
 MAX_TOTAL_CHUNK_BYTES = 96 * 1024 * 1024
 MAX_AUDIO_SECONDS = MAX_CHUNKS * CHUNK_SECONDS
 FFPROBE_TIMEOUT_SECONDS = 30
+MAX_CONCURRENT_UPLOADS = 4           # Parallel chunk upload concurrency
 
-PROVIDERS = {
+PROVIDERS: Dict[str, Dict[str, str]] = {
     "groq": {
         "endpoint": "https://api.groq.com/openai/v1/audio/transcriptions",
         "model": "whisper-large-v3",
@@ -46,6 +46,11 @@ PROVIDERS = {
         "model": "whisper-1",
         "key_field": "openai_api_key",
     },
+}
+
+_BLOCKED_HOSTS = {
+    "localhost",
+    "metadata.google.internal",
 }
 
 
@@ -61,19 +66,31 @@ class NoProviderConfigured(TranscribeError):
     """Raised when no provider has an API key configured."""
 
 
-_BLOCKED_HOSTS = {
-    "localhost",
-    "metadata.google.internal",
-}
+# --- HTTP Session with Automated Retries ---
+def _build_http_session() -> requests.Session:
+    """Creates a robust HTTP session with automatic retries for transient failures."""
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist={429, 500, 502, 503, 504},
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    session.mount("https://", adapter)
+    return session
 
 
+_HTTP_SESSION = _build_http_session()
+
+
+# --- Validation Helpers ---
 def _require(binary: str) -> None:
     if not shutil.which(binary):
-        raise MissingDependency(f"{binary} not found in PATH")
+        raise MissingDependency(f"Required binary '{binary}' not found in system PATH")
 
 
 def _require_size_at_most(path: Path, limit: int, label: str) -> int:
-    """Return file size or fail before expensive downstream processing."""
     size = path.stat().st_size
     if size > limit:
         limit_mib = limit / (1024 * 1024)
@@ -82,73 +99,46 @@ def _require_size_at_most(path: Path, limit: int, label: str) -> int:
 
 
 def _probe_audio_duration(path: Path) -> float:
-    """Return duration in seconds or fail closed before media generation."""
     _require("ffprobe")
     cmd = [
         "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        "-i",
-        str(path),
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        "-i", str(path),
     ]
     try:
         proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=FFPROBE_TIMEOUT_SECONDS,
+            cmd, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT_SECONDS
         )
     except subprocess.TimeoutExpired:
-        raise TranscribeError(
-            "ffprobe timed out while reading audio duration "
-            f"after {FFPROBE_TIMEOUT_SECONDS}s"
-        ) from None
+        raise TranscribeError(f"ffprobe timed out after {FFPROBE_TIMEOUT_SECONDS}s")
     except OSError as exc:
-        raise TranscribeError(
-            f"ffprobe could not read audio duration: {exc}"
-        ) from exc
+        raise TranscribeError(f"ffprobe execution failed: {exc}") from exc
 
     if proc.returncode != 0:
         detail = proc.stderr.strip()[:300] or "unknown ffprobe error"
-        raise TranscribeError(
-            f"ffprobe failed while reading audio duration: {detail}"
-        )
+        raise TranscribeError(f"ffprobe failed: {detail}")
 
-    raw_duration = proc.stdout.strip()
     try:
-        duration = float(raw_duration)
+        duration = float(proc.stdout.strip())
     except (TypeError, ValueError):
-        raise TranscribeError(
-            "ffprobe could not parse a valid audio duration"
-        ) from None
+        raise TranscribeError("ffprobe returned invalid duration format") from None
+
     if not math.isfinite(duration) or duration <= 0:
-        raise TranscribeError(
-            "ffprobe could not parse a valid positive audio duration"
-        )
+        raise TranscribeError("ffprobe returned non-positive audio duration")
     return duration
 
 
 def _require_duration_within_budget(path: Path) -> float:
-    """Reject audio that cannot fit within the bounded chunk budget."""
     duration = _probe_audio_duration(path)
     if duration > MAX_AUDIO_SECONDS:
         max_minutes = MAX_AUDIO_SECONDS // 60
-        raise TranscribeError(
-            f"audio duration exceeds safety limit of {max_minutes} minutes"
-        )
+        raise TranscribeError(f"Audio duration exceeds safety limit of {max_minutes} minutes")
     return duration
 
 
 def _run(cmd: List[str], timeout: int = 600) -> None:
-    """Run a subprocess, raising TranscribeError on nonzero exit or timeout.
-
-    cmd carries user-supplied URLs/paths into yt-dlp/ffmpeg — a stalled
-    network read or a hung probe must not block the CLI forever.
-    """
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -164,150 +154,102 @@ def _is_private_ip(value: str) -> bool:
         ip = ipaddress.ip_address(value)
     except ValueError:
         return False
-    return any(
-        (
-            ip.is_private,
-            ip.is_loopback,
-            ip.is_link_local,
-            ip.is_reserved,
-            ip.is_multicast,
-            ip.is_unspecified,
-        )
-    )
+    return any((
+        ip.is_private, ip.is_loopback, ip.is_link_local,
+        ip.is_reserved, ip.is_multicast, ip.is_unspecified
+    ))
 
 
 def _assert_safe_public_url(url: str) -> None:
-    """Reject literal local/internal URLs without DNS-resolving public hosts."""
     if "://" not in url:
-        before_slash = url.split("/", 1)[0]
-        if ":" in before_slash:
-            host_part, port_part = before_slash.rsplit(":", 1)
-            if not host_part or not port_part.isdigit():
-                raise TranscribeError("SSRF blocked: only public http(s) URLs are allowed")
         parsed = urlparse(f"https://{url}")
     else:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
-            raise TranscribeError("SSRF blocked: only public http(s) URLs are allowed")
+            raise TranscribeError("SSRF protection: only public http(s) URLs are allowed")
 
     host = (parsed.hostname or "").strip().lower().rstrip(".")
     if not host:
-        raise TranscribeError("SSRF blocked: URL host is missing")
+        raise TranscribeError("SSRF protection: URL host is missing")
     if host in _BLOCKED_HOSTS or host.endswith(".localhost"):
-        raise TranscribeError("SSRF blocked: internal host is not allowed")
+        raise TranscribeError("SSRF protection: internal host is restricted")
     if _is_private_ip(host):
-        raise TranscribeError("SSRF blocked: private/internal IP is not allowed")
+        raise TranscribeError("SSRF protection: private/internal IP addresses restricted")
 
 
+# --- Audio Processing Pipeline ---
 def download_audio(url: str, out_dir: Path) -> Path:
-    """Download audio with yt-dlp into out_dir; return the resulting file path."""
+    """Download audio safely with yt-dlp into target path."""
     _assert_safe_public_url(url)
     _require("yt-dlp")
     template = out_dir / "source.%(ext)s"
+    
     _run(
         [
             "yt-dlp",
             "-x",
-            "--audio-format",
-            "m4a",
-            "--audio-quality",
-            "0",
+            "--audio-format", "m4a",
+            "--audio-quality", "0",
             "--no-playlist",
-            "--max-filesize",
-            str(MAX_SOURCE_BYTES),
-            "-o",
-            str(template),
-            "--",
-            url,
+            "--max-filesize", str(MAX_SOURCE_BYTES),
+            "-o", str(template),
+            "--", url,
         ],
-        timeout=1800,  # long podcasts over slow networks — generous but bounded
+        timeout=1800,
     )
-    files = sorted(out_dir.glob("source.*"))
+    
+    # Filter out .part files to avoid race conditions on downloading streams
+    files = [f for f in sorted(out_dir.glob("source.*")) if not f.name.endswith(".part")]
     if not files:
         limit_mib = MAX_SOURCE_BYTES // (1024 * 1024)
-        raise TranscribeError(
-            f"yt-dlp produced no output file (source may exceed {limit_mib} MiB limit)"
-        )
+        raise TranscribeError(f"yt-dlp produced no output file (limit is {limit_mib} MiB)")
+    
     audio = files[0]
     _require_size_at_most(audio, MAX_SOURCE_BYTES, "downloaded source")
     return audio
 
 
 def compress_audio(src: Path, out_dir: Path) -> Path:
-    """Re-encode to mono / 16kHz / 32kbps m4a — keeps most content under 25MB."""
+    """Re-encode audio to high-efficiency mono 16kHz/32kbps AAC m4a."""
     _require("ffmpeg")
     dst = out_dir / "compressed.m4a"
-    _run(
-        [
-            "ffmpeg",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(src),
-            "-t",
-            str(MAX_AUDIO_SECONDS),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-b:a",
-            "32k",
-            str(dst),
-        ]
-    )
+    _run([
+        "ffmpeg", "-loglevel", "error", "-y",
+        "-i", str(src),
+        "-t", str(MAX_AUDIO_SECONDS),
+        "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+        str(dst)
+    ])
     return dst
 
 
 def chunk_audio(src: Path, out_dir: Path, segment_seconds: int = CHUNK_SECONDS) -> List[Path]:
-    """Split src into segments. Re-encodes each segment so cuts align to keyframes."""
+    """Split audio into precise segments aligned to keyframes."""
     if segment_seconds <= 0:
-        raise TranscribeError("chunk segment duration must be positive")
-    possible_chunks = (
-        MAX_AUDIO_SECONDS + segment_seconds - 1
-    ) // segment_seconds
-    if possible_chunks > MAX_CHUNKS:
-        raise TranscribeError(
-            f"chunk generation safety limit is {MAX_CHUNKS}; "
-            f"segment duration {segment_seconds}s could create "
-            f"{possible_chunks} chunks"
-        )
+        raise TranscribeError("Chunk segment duration must be positive")
+    
     _require("ffmpeg")
     pattern = out_dir / "chunk_%03d.m4a"
-    _run(
-        [
-            "ffmpeg",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(src),
-            "-t",
-            str(MAX_AUDIO_SECONDS),
-            "-f",
-            "segment",
-            "-segment_time",
-            str(segment_seconds),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-b:a",
-            "32k",
-            str(pattern),
-        ]
-    )
+    _run([
+        "ffmpeg", "-loglevel", "error", "-y",
+        "-i", str(src),
+        "-t", str(MAX_AUDIO_SECONDS),
+        "-f", "segment",
+        "-segment_time", str(segment_seconds),
+        "-ac", "1", "-ar", "16000", "-b:a", "32k",
+        str(pattern)
+    ])
+    
     chunks = sorted(out_dir.glob("chunk_*.m4a"))
     if not chunks:
-        raise TranscribeError("ffmpeg produced no chunks")
+        raise TranscribeError("ffmpeg produced no valid chunks")
     return chunks
 
 
+# --- API Transcribe Dispatcher ---
 def _provider_key(provider: str, config: Config) -> Optional[str]:
     field = PROVIDERS[provider]["key_field"]
-    val = config.get(field)
-    return val or None
+    return config.get(field) or None
 
 
 def transcribe_chunk(
@@ -317,21 +259,21 @@ def transcribe_chunk(
     config: Optional[Config] = None,
     timeout: int = 120,
 ) -> str:
-    """Transcribe one chunk via the named provider. Raises TranscribeError on failure."""
+    """Transcribe single chunk with specified API provider."""
     if provider not in PROVIDERS:
-        raise TranscribeError(f"unknown provider: {provider}")
+        raise TranscribeError(f"Unknown provider: {provider}")
+    
     cfg = config or Config()
     key = _provider_key(provider, cfg)
     if not key:
         raise NoProviderConfigured(
-            f"{provider}: missing {PROVIDERS[provider]['key_field']} "
-            f"(configure with `agent-reach configure {provider}-key ...`)"
+            f"{provider}: missing key '{PROVIDERS[provider]['key_field']}'"
         )
 
     info = PROVIDERS[provider]
     with chunk.open("rb") as fh:
         try:
-            resp = requests.post(
+            resp = _HTTP_SESSION.post(
                 info["endpoint"],
                 headers={"Authorization": f"Bearer {key}"},
                 files={"file": (chunk.name, fh, "audio/m4a")},
@@ -351,88 +293,106 @@ def _provider_order(provider: str) -> List[str]:
         return ["groq", "openai"]
     if provider in PROVIDERS:
         return [provider]
-    raise TranscribeError(f"unknown provider: {provider} (use groq|openai|auto)")
-
-
-def transcribe(
-    source: str,
-    *,
-    provider: str = "auto",
-    out_dir: Optional[Path] = None,
-    config: Optional[Config] = None,
-) -> str:
-    """Transcribe a URL or local file path. Returns the joined transcript text.
-
-    `provider` is one of `auto` (groq → openai), `groq`, or `openai`.
-    `out_dir` defaults to a fresh temp directory; intermediate files stay there.
-    """
-    cfg = config or Config()
-    order = _provider_order(provider)
-
-    # Validate at least one provider is configured before doing expensive work.
-    if not any(_provider_key(p, cfg) for p in order):
-        names = ", ".join(PROVIDERS[p]["key_field"] for p in order)
-        raise NoProviderConfigured(f"no provider key configured (need one of: {names})")
-
-    if out_dir:
-        return _transcribe_in_dir(source, order, cfg, Path(out_dir))
-
-    with tempfile.TemporaryDirectory(prefix="transcribe-") as tmp:
-        return _transcribe_in_dir(source, order, cfg, Path(tmp))
-
-
-def _transcribe_in_dir(source: str, order: List[str], cfg: Config, work_dir: Path) -> str:
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    src_path = Path(source)
-    if src_path.is_file():
-        audio = src_path
-    else:
-        audio = download_audio(source, work_dir)
-
-    _require_size_at_most(audio, MAX_SOURCE_BYTES, "source")
-    _require_duration_within_budget(audio)
-    compressed = compress_audio(audio, work_dir)
-    if compressed.stat().st_size <= SIZE_LIMIT_BYTES:
-        chunks = [compressed]
-    else:
-        chunks = chunk_audio(compressed, work_dir)
-
-    if len(chunks) > MAX_CHUNKS:
-        max_minutes = MAX_CHUNKS * CHUNK_SECONDS // 60
-        raise TranscribeError(
-            f"audio produced {len(chunks)} chunks; safety limit is "
-            f"{MAX_CHUNKS} (~{max_minutes} minutes)"
-        )
-    chunk_sizes = [
-        _require_size_at_most(chunk, SIZE_LIMIT_BYTES, f"chunk {chunk.name}")
-        for chunk in chunks
-    ]
-    total_chunk_bytes = sum(chunk_sizes)
-    if total_chunk_bytes > MAX_TOTAL_CHUNK_BYTES:
-        limit_mib = MAX_TOTAL_CHUNK_BYTES / (1024 * 1024)
-        raise TranscribeError(
-            f"audio chunks total {total_chunk_bytes} bytes; "
-            f"safety limit is {limit_mib:g} MiB"
-        )
-
-    pieces: List[str] = []
-    for chunk in chunks:
-        text = _transcribe_with_fallback(chunk, order, cfg)
-        pieces.append(text.strip())
-    return "\n".join(p for p in pieces if p)
+    raise TranscribeError(f"Invalid provider: {provider} (expected: groq | openai | auto)")
 
 
 def _transcribe_with_fallback(chunk: Path, order: List[str], config: Config) -> str:
-    """Try each provider in order; return first success or raise the last error."""
+    """Attempt execution across providers in waterfall sequence."""
     last_err: Optional[Exception] = None
     for p in order:
         if not _provider_key(p, config):
-            # Skip silently — caller already validated at least one is configured.
             continue
         try:
             return transcribe_chunk(chunk, p, config=config)
         except TranscribeError as e:
             last_err = e
             continue
-    raise TranscribeError(f"all providers failed for {chunk.name}: {last_err}")
+    raise TranscribeError(f"All providers failed for {chunk.name}: {last_err}")
+
+
+# --- Primary Entry Points ---
+def transcribe(
+    source: str,
+    *,
+    provider: str = "auto",
+    out_dir: Optional[Path] = None,
+    config: Optional[Config] = None,
+    parallel: bool = True,
+) -> str:
+    """Transcribe a local file or remote URL into complete transcript text.
+
+    Args:
+        source: URL or filesystem path to target audio.
+        provider: Provider selection strategy ("auto", "groq", "openai").
+        out_dir: Custom work directory (uses safe temporary directory if None).
+        config: AgentReach Config instance.
+        parallel: Enable multi-threaded concurrent chunk processing.
+    """
+    cfg = config or Config()
+    order = _provider_order(provider)
+
+    if not any(_provider_key(p, cfg) for p in order):
+        names = ", ".join(PROVIDERS[p]["key_field"] for p in order)
+        raise NoProviderConfigured(f"No valid API keys configured (expected one of: {names})")
+
+    if out_dir:
+        return _transcribe_in_dir(source, order, cfg, Path(out_dir), parallel=parallel)
+
+    with tempfile.TemporaryDirectory(prefix="transcribe-") as tmp:
+        return _transcribe_in_dir(source, order, cfg, Path(tmp), parallel=parallel)
+
+
+def _transcribe_in_dir(
+    source: str,
+    order: List[str],
+    cfg: Config,
+    work_dir: Path,
+    parallel: bool = True,
+) -> str:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    src_path = Path(source)
+    audio = src_path if src_path.is_file() else download_audio(source, work_dir)
+
+    _require_size_at_most(audio, MAX_SOURCE_BYTES, "source")
+    _require_duration_within_budget(audio)
+
+    compressed = compress_audio(audio, work_dir)
+    chunks = (
+        [compressed]
+        if compressed.stat().st_size <= SIZE_LIMIT_BYTES
+        else chunk_audio(compressed, work_dir)
+    )
+
+    if len(chunks) > MAX_CHUNKS:
+        max_minutes = MAX_CHUNKS * CHUNK_SECONDS // 60
+        raise TranscribeError(
+            f"Audio produced {len(chunks)} chunks (max allowed is {MAX_CHUNKS}, ~{max_minutes} mins)"
+        )
+
+    # Validate chunk bounds
+    total_chunk_bytes = sum(
+        _require_size_at_most(chunk, SIZE_LIMIT_BYTES, f"chunk {chunk.name}")
+        for chunk in chunks
+    )
+    if total_chunk_bytes > MAX_TOTAL_CHUNK_BYTES:
+        limit_mib = MAX_TOTAL_CHUNK_BYTES / (1024 * 1024)
+        raise TranscribeError(
+            f"Total chunk batch size {total_chunk_bytes} bytes exceeds {limit_mib:g} MiB limit"
+        )
+
+    # Process chunks (Parallel vs Sequential)
+    results: List[str] = [""] * len(chunks)
+    if parallel and len(chunks) > 1:
+        with ThreadPoolExecutor(max_workers=min(len(chunks), MAX_CONCURRENT_UPLOADS)) as executor:
+            future_to_idx = {
+                executor.submit(_transcribe_with_fallback, chunk, order, cfg): i
+                for i, chunk in enumerate(chunks)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                results[idx] = future.result().strip()
+    else:
+        for i, chunk in enumerate(chunks):
+            results[i] = _transcribe_with_fallback(chunk, order, cfg).strip()
+
+    return "\n".join(p for p in results if p)
